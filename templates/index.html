@@ -135,7 +135,7 @@
 <body>
 <header>
   <h1>纸张对折打孔 · 展开预览</h1>
-  <p>设定纸张与折法 → 在最终折叠面上点击打孔（或开启「反查打孔」直接在展开图上点目标孔心，或在左侧「目标孔位排版」逐行录入目标孔心自动生成方案）→ 系统按折叠顺序逆推全部孔位（坐标单位 mm，原点在纸面左下角）。可划定原纸保护区，孔圆触碰保护区即禁止生成展开图。</p>
+  <p>设定纸张与折法 → 在最终折叠面上点击打孔（或开启「反查打孔」直接在展开图上点目标孔心，或在左侧「目标孔位排版」逐行录入目标孔心自动生成方案）→ 系统按折叠顺序逆推全部孔位（坐标单位 mm，原点在纸面左下角）。可划定原纸保护区，孔圆触碰保护区即禁止生成展开图；可设定最小纸桥宽度，展开后任意两孔圆边净距小于它即判冲突。</p>
 </header>
 
 <div class="layout">
@@ -152,6 +152,9 @@
     </div>
     <label class="field"><span>打孔半径 r (mm，孔心距任何边界/折痕须大于 r)</span>
       <input type="number" id="inR" min="{{ min_radius }}" max="{{ max_radius }}" step="0.5" value="3">
+    </label>
+    <label class="field"><span>最小纸桥宽度 (mm，0 表示关闭；展开后任意两孔圆边净距须 ≥ 该值)</span>
+      <input type="number" id="inBridge" min="0" max="{{ max_dim }}" step="0.5" value="0">
     </label>
     <div class="presets">
       <button type="button" data-preset="a4">A4 纵向 210×297</button>
@@ -290,8 +293,9 @@
 
   // 状态：points 为最终折叠面上的【归一化】坐标 {x,y} ∈ [0,1]
   // zones 为原纸上的轴对齐矩形保护区 {x, y, w, h}（mm，左下角为 (x,y)）
-  var state = { width: 210, height: 297, radius: 3, folds: ["vR"], points: [],
-                zones: [] };
+  // minBridge 为最小纸桥宽度（mm，0 表示关闭圆边净距判定）
+  var state = { width: 210, height: 297, radius: 3, minBridge: 0,
+                folds: ["vR"], points: [], zones: [] };
   var lastResult = null;
   var reqSeq = 0;
   var inflight = false;
@@ -584,7 +588,8 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         width: state.width, height: state.height, radius: state.radius,
-        folds: state.folds, zones: state.zones,
+        folds: state.folds, zones: state.zones, minBridge: state.minBridge,
+        points: state.points,   // 纸桥净距按「加入现有孔位后的全集」判定
         target: { x: +pt.x.toFixed(6), y: +pt.y.toFixed(6) }
       })
     }).then(function (resp) {
@@ -767,21 +772,27 @@
   // ---------------- 控件绑定 ----------------
   function readInputs() {
     var w = parseFloat($("inW").value), h = parseFloat($("inH").value),
-        r = parseFloat($("inR").value);
-    if (!isFinite(w) || !isFinite(h) || !isFinite(r)) {
-      setStatus("warn", "请输入有效的纸张宽高与打孔半径。");
+        r = parseFloat($("inR").value), b = parseFloat($("inBridge").value);
+    if (!isFinite(w) || !isFinite(h) || !isFinite(r) || !isFinite(b)) {
+      setStatus("warn", "请输入有效的纸张宽高、打孔半径与最小纸桥宽度。");
       return false;
     }
-    state.width = w; state.height = h; state.radius = r;
+    if (b < 0) {
+      setStatus("warn", "最小纸桥宽度不能为负（0 表示关闭该判定）。");
+      return false;
+    }
+    state.width = w; state.height = h; state.radius = r; state.minBridge = b;
     return true;
   }
 
-  ["inW", "inH", "inR"].forEach(function (id) {
+  ["inW", "inH", "inR", "inBridge"].forEach(function (id) {
     $(id).addEventListener("input", function () {
-      var pw = state.width, ph = state.height, pr = state.radius;
+      var pw = state.width, ph = state.height, pr = state.radius,
+          pb = state.minBridge;
       if (readInputs()) {
-        // 纸张或半径一变，待确认的反查预览与排版方案即失效
-        if (pw !== state.width || ph !== state.height || pr !== state.radius) {
+        // 纸张、半径或纸桥宽度一变，待确认的反查预览与排版方案即失效
+        if (pw !== state.width || ph !== state.height ||
+            pr !== state.radius || pb !== state.minBridge) {
           clearPending();
           clearPlan();
         }
@@ -926,7 +937,8 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         width: state.width, height: state.height, radius: state.radius,
-        folds: state.folds, zones: state.zones, targets: parsed.targets
+        folds: state.folds, zones: state.zones, minBridge: state.minBridge,
+        targets: parsed.targets
       })
     }).then(function (resp) {
       return resp.json().then(function (data) { return { ok: resp.ok, data: data }; });

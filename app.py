@@ -25,6 +25,13 @@
   任一展开孔圆与任一保护区相交或相切即违规：指出原打孔点、触碰的展开孔
   及保护区，不生成展开 SVG、禁止下载；反查打孔的待确认结果同样判定。
   保护区必须完整位于原纸内，纸张尺寸改动导致越界时提示修正。
+- 最小纸桥宽度：可选设定（mm，0 表示关闭）。启用后先按现有坐标容差合并
+  展开孔位，再检查任意两个不同孔的圆边净距（圆心距 - 2r）：净距小于设定
+  宽度即冲突，相等（±BRIDGE_TOL）可通过。用空间网格查找邻近孔对，避免
+  大批量目标排版时逐对扫描；返回首个冲突的两孔坐标与实际净距。手动打孔、
+  反查待确认、目标孔位排版与 SVG 下载共用该判定；反查按加入现有孔位后的
+  全集判定，排版按替换后的方案判定。冲突时不给出可确认方案或可下载 SVG，
+  修改参数后重新计算。
 """
 
 from __future__ import annotations
@@ -52,6 +59,8 @@ MAX_RADIUS = 50.0       # mm
 EDGE_TOL = 0.05         # mm，边界判定容差（浮点误差 + 必须严格在内侧）
 ROUND_TRIP_TOL = 1e-6   # mm，归一化坐标往返（mm -> 归一化 -> mm）的浮点误差宽限：
                         # 反查/排版给出的孔心确认后重算时，不被同一校验误拒
+BRIDGE_TOL = 1e-6       # mm，纸桥净距与设定宽度相差在此以内视为「相等」，可通过
+                        # （展开孔位按 1e-6mm 舍入，容差与坐标粒度一致）
 
 ALLOWED_FOLDS = ("vL", "vR", "hT", "hB")
 EDGE_NAMES = {
@@ -220,6 +229,50 @@ def dedupe_with_index(points, tol=1e-5):
             cells.setdefault((cx, cy), []).append((found, (x, y)))
         index.append(found)
     return uniq, index
+
+
+# ---------------------------------------------------------------------------
+# 最小纸桥宽度（展开孔圆边净距下限，0 表示关闭）
+# ---------------------------------------------------------------------------
+def find_bridge_conflict(holes, radius, min_bridge):
+    """在已按坐标容差合并的展开孔位中，找第一对圆边净距不足的不同孔。
+
+    圆边净距 = 圆心距 - 2*radius；净距严格小于 min_bridge 即冲突，
+    相等（±BRIDGE_TOL）可通过。网格边长取 2*radius + min_bridge：
+    净距不足的孔对圆心距必小于该边长，只可能落在相邻九宫格内，
+    因此无需逐对扫描（排版场景可达数千个孔）。按 holes 顺序逐点插入、
+    只与已插入点比较，首先发现的冲突对是确定的。
+    返回 (hole1, hole2, 实际净距) 或 None。
+    """
+    if min_bridge <= 0.0 or len(holes) < 2:
+        return None
+    reach = 2.0 * radius + min_bridge
+    limit = min_bridge - BRIDGE_TOL
+    cells = {}
+    for h in holes:
+        x, y = h["x"], h["y"]
+        cx, cy = math.floor(x / reach), math.floor(y / reach)
+        for ix in (cx - 1, cx, cx + 1):
+            for iy in (cy - 1, cy, cy + 1):
+                for qx, qy, q in cells.get((ix, iy), ()):
+                    clearance = math.hypot(x - qx, y - qy) - 2.0 * radius
+                    if clearance < limit:
+                        return q, h, clearance
+        cells.setdefault((cx, cy), []).append((x, y, h))
+    return None
+
+
+def bridge_conflict_msg(h1, h2, clearance, min_bridge):
+    """首个纸桥冲突的中文描述：两孔坐标（原纸 mm）与实际净距。"""
+    return (f"展开后的孔 ({h1['x']:.2f}, {h1['y']:.2f})mm 与 "
+            f"({h2['x']:.2f}, {h2['y']:.2f})mm 的圆边净距仅 "
+            f"{clearance:.2f}mm，小于最小纸桥宽度 {min_bridge:g}mm"
+            "（两孔之间的纸桥过窄，净距须大于或等于设定宽度）")
+
+
+def bridge_error_dict(h1, h2, clearance):
+    """首个冲突的结构化信息，供客户端定位/展示。"""
+    return {"hole1": h1, "hole2": h2, "clearance": round(clearance, 6)}
 
 
 def check_point(px, py, w, h, radius, edges):
@@ -449,7 +502,11 @@ def _num(obj, key, lo, hi, name):
 
 
 def _validate_sheet(payload):
-    """校验纸张尺寸、打孔半径与折法，返回 (width, height, radius, folds)。"""
+    """校验纸张尺寸、打孔半径、折法与最小纸桥宽度。
+
+    返回 (width, height, radius, folds, min_bridge)；min_bridge 为可选
+    （缺省 0，表示关闭纸桥净距判定）。
+    """
     width = _num(payload, "width", MIN_DIM, MAX_DIM, "纸张宽度")
     height = _num(payload, "height", MIN_DIM, MAX_DIM, "纸张高度")
     radius = _num(payload, "radius", MIN_RADIUS, MAX_RADIUS, "打孔半径")
@@ -460,7 +517,14 @@ def _validate_sheet(payload):
     for f in folds:
         if f not in ALLOWED_FOLDS:
             raise ValueError("存在非法折叠方向，可选：vL / vR / hT / hB")
-    return width, height, radius, folds
+
+    min_bridge = payload.get("minBridge", 0.0)
+    if isinstance(min_bridge, bool) or not isinstance(min_bridge, (int, float)):
+        raise ValueError("最小纸桥宽度必须是数字")
+    min_bridge = float(min_bridge)
+    if not math.isfinite(min_bridge) or min_bridge < 0.0 or min_bridge > MAX_DIM:
+        raise ValueError(f"最小纸桥宽度须在 0 ~ {MAX_DIM:g} 之间（0 表示关闭）")
+    return width, height, radius, folds, min_bridge
 
 
 def _check_face_capacity(w, h, radius):
@@ -499,7 +563,7 @@ def compute(payload):
     if not isinstance(payload, dict):
         raise ValueError("请求体必须是 JSON 对象")
 
-    width, height, radius, folds = _validate_sheet(payload)
+    width, height, radius, folds, min_bridge = _validate_sheet(payload)
     zones = _validate_zones(payload)
 
     points = payload.get("points", [])
@@ -520,6 +584,7 @@ def compute(payload):
 
     error_msg, error_idx = None, -1
     zone_error = None
+    bridge_error = None
     holes, creases, unfolded_svg = [], [], None
 
     # 保护区必须完整位于原纸内（纸张尺寸改小导致越界时在此提示修正）
@@ -548,10 +613,20 @@ def compute(payload):
             zone_error = {"kind": "hit", "pointIndex": src,
                           "hole": hole, "zoneIndex": zi}
         else:
-            holes = dedupe_points(raw)
-            creases = crease_grid(width, height, nv, nh)
-            unfolded_svg = build_unfolded_svg(
-                width, height, holes, creases, radius, nv, nh, zones)
+            merged = dedupe_points(raw)
+            # 最小纸桥宽度：先按坐标容差合并展开孔位（上面的 dedupe），
+            # 再检查任意两个不同孔的圆边净距；冲突时不生成展开 SVG
+            conflict = find_bridge_conflict(merged, radius, min_bridge)
+            if conflict:
+                h1, h2, clearance = conflict
+                error_msg = (bridge_conflict_msg(h1, h2, clearance, min_bridge)
+                             + "，请调整打孔位置、折法或减小最小纸桥宽度。")
+                bridge_error = bridge_error_dict(h1, h2, clearance)
+            else:
+                holes = merged
+                creases = crease_grid(width, height, nv, nh)
+                unfolded_svg = build_unfolded_svg(
+                    width, height, holes, creases, radius, nv, nh, zones)
 
     folded_svg, pad, vb_w, vb_h = build_folded_svg(
         w, h, edges, mm_pts, radius, error_idx)
@@ -573,6 +648,7 @@ def compute(payload):
         "error": error_msg,
         "errorIndex": error_idx,
         "zoneError": zone_error,
+        "bridgeError": bridge_error,
     }
 
 
@@ -581,12 +657,25 @@ def reverse_lookup(payload):
 
     目标点或折回后的孔心若使打孔半径触及纸张边界/折痕，抛出带具体原因的
     ValueError，客户端据此禁止确认。连带孔与保护区相交/相切时同样拒绝。
+    启用最小纸桥宽度时，按「加入现有打孔点后的展开孔全集」判定圆边净距，
+    冲突即拒绝（不给出可确认方案）。
     """
     if not isinstance(payload, dict):
         raise ValueError("请求体必须是 JSON 对象")
 
-    width, height, radius, folds = _validate_sheet(payload)
+    width, height, radius, folds, min_bridge = _validate_sheet(payload)
     zones = _validate_zones(payload)
+
+    # 现有打孔点（归一化坐标）：纸桥净距按加入现有孔位后的全集判定
+    points = payload.get("points", [])
+    if not isinstance(points, list) or len(points) > MAX_HOLES:
+        raise ValueError(f"现有打孔点数量须为 0 ~ {MAX_HOLES} 个")
+    norm_pts = []
+    for p in points:
+        if not isinstance(p, dict):
+            raise ValueError("打孔点格式错误")
+        norm_pts.append({"x": _num(p, "x", 0.0, 1.0, "打孔点 x"),
+                         "y": _num(p, "y", 0.0, 1.0, "打孔点 y")})
 
     target = payload.get("target")
     if not isinstance(target, dict):
@@ -626,6 +715,18 @@ def reverse_lookup(payload):
             f"反查打孔（目标孔心 ({tx:.2f}, {ty:.2f})mm）",
             hole["x"], hole["y"], zi, zones[zi], radius))
 
+    # 最小纸桥宽度：把本次反查打孔加入现有打孔点后，按展开孔全集判定
+    if min_bridge > 0.0:
+        mm_pts = [{"x": p["x"] * w, "y": p["y"] * h} for p in norm_pts]
+        full = dedupe_points(unfold_points(mm_pts + [{"x": fx, "y": fy}],
+                                           folds, width, height))
+        conflict = find_bridge_conflict(full, radius, min_bridge)
+        if conflict:
+            h1, h2, clearance = conflict
+            raise ValueError(
+                bridge_conflict_msg(h1, h2, clearance, min_bridge)
+                + "，请调整目标孔心、现有打孔点、折法或减小最小纸桥宽度。")
+
     holes = dedupe_points(raw)
 
     return {
@@ -646,13 +747,15 @@ def plan_layout(payload):
 
     每个目标先折回最终折叠面、再展开为完整连带孔组；全部连带孔按坐标
     容差去重后与目标集合比对。只有二者完全一致、方案打孔点数不超过
-    MAX_HOLES 且通过边界/折痕/保护区校验时才可行；否则指出缺少的
-    连带孔或违规目标及原因。存在违规目标时不给出预览（部分方案会误导）。
+    MAX_HOLES 且通过边界/折痕/保护区/最小纸桥宽度校验时才可行；否则指出
+    缺少的连带孔或违规目标及原因。存在违规目标时不给出预览（部分方案会
+    误导）。纸桥净距按「替换后的方案」的展开孔全集判定，冲突时方案
+    不可确认。
     """
     if not isinstance(payload, dict):
         raise ValueError("请求体必须是 JSON 对象")
 
-    width, height, radius, folds = _validate_sheet(payload)
+    width, height, radius, folds, min_bridge = _validate_sheet(payload)
     zones = _validate_zones(payload)
 
     targets = payload.get("targets")
@@ -740,6 +843,7 @@ def plan_layout(payload):
     holes, missing, points = [], [], []
     folded_svg = unfolded_svg = None
     error = None
+    bridge_error = None
 
     if violations:
         error = (f"{len(violations)} 个目标孔心违规"
@@ -773,6 +877,17 @@ def plan_layout(payload):
             error = (f"按当前折法会额外带出 {len(missing)} 个连带孔"
                      f"（如 ({missing[0]['x']:g}, {missing[0]['y']:g})mm），"
                      "未包含在目标列表中，方案不可用。")
+        elif min_bridge > 0.0:
+            # 最小纸桥宽度：按「替换后的方案」的展开孔全集判定，
+            # 冲突时方案不可确认（保留预览便于定位冲突孔位）
+            conflict = find_bridge_conflict(holes, radius, min_bridge)
+            if conflict:
+                h1, h2, clearance = conflict
+                feasible = False
+                bridge_error = bridge_error_dict(h1, h2, clearance)
+                error = (bridge_conflict_msg(h1, h2, clearance, min_bridge)
+                         + "，请调整目标孔位、折法或减小最小纸桥宽度，"
+                         "方案不可用。")
 
     return {
         "ok": True,
@@ -785,6 +900,7 @@ def plan_layout(payload):
         "targetCount": len(norm_targets),
         "missing": missing,
         "violations": violations,
+        "bridgeError": bridge_error,
         "foldedWidth": round(w, 6),
         "foldedHeight": round(h, 6),
         "foldedSvg": folded_svg,
@@ -819,7 +935,8 @@ def api_unfold():
 
 @app.route("/api/reverse", methods=["POST"])
 def api_reverse():
-    """反查打孔：入参 {width, height, radius, folds, zones, target:{x,y}(原纸 mm)}。"""
+    """反查打孔：入参 {width, height, radius, folds, zones, minBridge,
+    points: [{x,y} 归一化]（现有打孔点，纸桥全集判定用）, target:{x,y}(原纸 mm)}。"""
     payload = request.get_json(force=True, silent=True)
     if payload is None:
         return _bad("请求不是合法 JSON")
@@ -831,7 +948,7 @@ def api_reverse():
 
 @app.route("/api/plan", methods=["POST"])
 def api_plan():
-    """目标孔位排版：入参 {width, height, radius, folds, zones,
+    """目标孔位排版：入参 {width, height, radius, folds, zones, minBridge,
     targets: [{x, y} 原纸 mm]}。"""
     payload = request.get_json(force=True, silent=True)
     if payload is None:
