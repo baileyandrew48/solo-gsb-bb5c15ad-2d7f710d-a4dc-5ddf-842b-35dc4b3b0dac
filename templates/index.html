@@ -135,7 +135,7 @@
 <body>
 <header>
   <h1>纸张对折打孔 · 展开预览</h1>
-  <p>设定纸张与折法 → 在最终折叠面上点击打孔（或开启「反查打孔」直接在展开图上点目标孔心，或在左侧「目标孔位排版」逐行录入目标孔心自动生成方案）→ 系统按折叠顺序逆推全部孔位（坐标单位 mm，原点在纸面左下角）。可划定原纸保护区，孔圆触碰保护区即禁止生成展开图。</p>
+  <p>设定纸张与折法 → 在最终折叠面上点击打孔（或开启「反查打孔」直接在展开图上点目标孔心，或在左侧「目标孔位排版」逐行录入目标孔心自动生成方案）→ 系统按折叠顺序逆推全部孔位（坐标单位 mm，原点在纸面左下角）。可划定原纸保护区，孔圆触碰保护区即禁止生成展开图；也可设定最小纸桥宽度（0 表示关闭），任意两孔圆边净距小于该值即冲突，冲突时不生成展开图、禁止下载。</p>
 </header>
 
 <div class="layout">
@@ -152,6 +152,9 @@
     </div>
     <label class="field"><span>打孔半径 r (mm，孔心距任何边界/折痕须大于 r)</span>
       <input type="number" id="inR" min="{{ min_radius }}" max="{{ max_radius }}" step="0.5" value="3">
+    </label>
+    <label class="field"><span>最小纸桥宽度 (mm，0 表示关闭；相邻孔圆边净距小于该值即冲突，相等可通过)</span>
+      <input type="number" id="inBridge" min="0" max="{{ max_dim }}" step="0.5" value="0">
     </label>
     <div class="presets">
       <button type="button" data-preset="a4">A4 纵向 210×297</button>
@@ -209,8 +212,8 @@
     <h2 style="margin-top:16px">目标孔位排版</h2>
     <p class="hint">按原纸 mm 坐标逐行输入目标孔心（每行「x y」或「x, y」）。
       系统把每个目标折回折叠面再展开为完整连带孔组：仅当连带孔集合与目标
-      集合完全一致、打孔点不超上限且通过边界/折痕/保护区校验时才生成可用
-      方案，否则指出缺少的连带孔或违规目标及原因。</p>
+      集合完全一致、打孔点不超上限且通过边界/折痕/保护区/纸桥净距校验时才
+      生成可用方案，否则指出首个纸桥冲突对、缺少的连带孔或违规目标及原因。</p>
     <textarea id="planTargets" rows="5" spellcheck="false"
       placeholder="52.5 74.25&#10;157.5 74.25"></textarea>
     <div class="toolbar" style="margin-top:6px">
@@ -290,7 +293,7 @@
 
   // 状态：points 为最终折叠面上的【归一化】坐标 {x,y} ∈ [0,1]
   // zones 为原纸上的轴对齐矩形保护区 {x, y, w, h}（mm，左下角为 (x,y)）
-  var state = { width: 210, height: 297, radius: 3, folds: ["vR"], points: [],
+  var state = { width: 210, height: 297, radius: 3, minBridge: 0, folds: ["vR"], points: [],
                 zones: [] };
   var lastResult = null;
   var reqSeq = 0;
@@ -584,7 +587,9 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         width: state.width, height: state.height, radius: state.radius,
+        minBridge: state.minBridge,
         folds: state.folds, zones: state.zones,
+        points: state.points,
         target: { x: +pt.x.toFixed(6), y: +pt.y.toFixed(6) }
       })
     }).then(function (resp) {
@@ -734,9 +739,15 @@
     return { targets: targets };
   }
 
-  // 不可实现时的明细：违规目标及原因 / 缺少的连带孔 / 打孔点超限
+  // 不可实现时的明细：纸桥冲突 / 违规目标及原因 / 缺少的连带孔 / 打孔点超限
   function planProblemText(d) {
     var lines = [];
+    if (d.bridgeError) {
+      var b = d.bridgeError;
+      lines.push("最小纸桥宽度冲突：孔 (" + b.holeA.x + ", " + b.holeA.y +
+        ") 与孔 (" + b.holeB.x + ", " + b.holeB.y + ") 的圆边净距仅 " +
+        b.clearance.toFixed(2) + "mm，需修改孔位或调小/关闭纸桥宽度后重新计算。");
+    }
     if (d.violations && d.violations.length) {
       lines.push("违规目标 " + d.violations.length + " 个（无法落位）：");
       d.violations.slice(0, 5).forEach(function (v) {
@@ -768,26 +779,37 @@
   function readInputs() {
     var w = parseFloat($("inW").value), h = parseFloat($("inH").value),
         r = parseFloat($("inR").value);
+    // 最小纸桥宽度：留空按 0（关闭）处理
+    var rawB = $("inBridge").value.trim();
+    var b = rawB === "" ? 0 : parseFloat(rawB);
     if (!isFinite(w) || !isFinite(h) || !isFinite(r)) {
       setStatus("warn", "请输入有效的纸张宽高与打孔半径。");
       return false;
     }
-    state.width = w; state.height = h; state.radius = r;
-    return true;
+    if (!isFinite(b) || b < 0 || b > {{ max_dim }}) {
+      setStatus("warn", "最小纸桥宽度须为 0（关闭）~ {{ max_dim }} mm 之间的数字。");
+      return false;
+    }
+    var changed = (state.width !== w || state.height !== h ||
+                   state.radius !== r || state.minBridge !== b);
+    state.width = w; state.height = h; state.radius = r; state.minBridge = b;
+    return changed ? true : null;
   }
 
-  ["inW", "inH", "inR"].forEach(function (id) {
+  ["inW", "inH", "inR", "inBridge"].forEach(function (id) {
     $(id).addEventListener("input", function () {
-      var pw = state.width, ph = state.height, pr = state.radius;
-      if (readInputs()) {
-        // 纸张或半径一变，待确认的反查预览与排版方案即失效
-        if (pw !== state.width || ph !== state.height || pr !== state.radius) {
-          clearPending();
-          clearPlan();
-        }
-        renderZoneList();   // 纸张改小可能使保护区越界，即时标红提示修正
-        schedule(false);
+      var pw = state.width, ph = state.height, pr = state.radius,
+          pb = state.minBridge;
+      var res = readInputs();
+      if (res === false) return;
+      // 纸张、半径或纸桥宽度一变，待确认的反查预览与排版方案即失效
+      if (pw !== state.width || ph !== state.height ||
+          pr !== state.radius || pb !== state.minBridge) {
+        clearPending();
+        clearPlan();
       }
+      renderZoneList();   // 纸张改小可能使保护区越界，即时标红提示修正
+      schedule(false);
     });
   });
 
@@ -926,6 +948,7 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         width: state.width, height: state.height, radius: state.radius,
+        minBridge: state.minBridge,
         folds: state.folds, zones: state.zones, targets: parsed.targets
       })
     }).then(function (resp) {
